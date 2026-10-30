@@ -149,16 +149,7 @@ pytest tests/ -v
 - **S3 (Port closure):** Fake disruption email → gateway checks real AIS feed → DENY uneconomic air freight
 - **S4 (Poisoned PDF):** Inflated invoice +12% → gateway checks PO → DENY price variance
 
-## Build Timeline
-
-- **Day 1 (Oct 28):** Contracts, skeleton, model eval setup
-- **Day 2 (Oct 29):** Gateway rules, ERP sim golden data
-- **Day 3 (Oct 30):** Agent planner, tools, sensing/logistics agents
-- **Day 4 (Oct 31):** End-to-end S1-S3, approvals, UI
-- **Day 5 (Nov 1):** SAP integration, artifacts, GO/NO-GO
-- **Day 6 (Nov 2):** Hardening, backup video, rehearsals
-- **Day 7 (Nov 3):** Freeze 12:00 IST, final rehearsals
-- **Finale (Nov 4):** NHCE presentation
+ 
 
 ## Team
 
