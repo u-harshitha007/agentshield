@@ -175,23 +175,5 @@ pytest tests/ -v
 - [Demo Runbook](docs/runbook-demo.md)
 - [Contract Change Requests](docs/contract-change-requests.md)
 
-## Status
+ 
 
-🚧 **In Active Development - Day 1** 🚧
-
-- [x] Project structure
-- [x] Master spec
-- [x] Agent service skeleton (Harshita)
-- [ ] Gateway service (Chandan) - In progress
-- [ ] ERP sim (Kirti) - Starting
-- [ ] Contracts finalized (Pavan)
-
-## License
-
-MIT (for hackathon purposes)
-
-## Notes
-
-- **Not SAP certified** - Educational prototype
-- **Synthetic data only** - No real credentials/accounts
-- **Not production ready** - Proof of concept for SAP Hackfest 2026
