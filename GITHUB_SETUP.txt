@@ -1,0 +1,74 @@
+========================================
+STEP-BY-STEP: PUSH TO GITHUB
+========================================
+
+YOUR CODE IS READY! Follow these steps:
+
+========================================
+STEP 1: Create Repository on GitHub
+========================================
+
+1. Open browser: https://github.com/new
+
+2. Fill in:
+   - Repository name: agentshield
+   - Description: AgentShield v2 - Security layer for AI agents in supply chain (SAP Hackfest 2026)
+   - Public or Private: Choose Public
+   - DO NOT check "Add README" (you already have one!)
+
+3. Click "Create repository"
+
+========================================
+STEP 2: Copy These Commands
+========================================
+
+Open PowerShell and run these commands ONE BY ONE:
+
+# Command 1: Go to your project
+cd "C:\Users\Harshitha\OneDrive\Desktop\py projects\agentshield"
+
+# Command 2: Add GitHub remote
+git remote add origin https://github.com/u-harshitha007/agentshield.git
+
+# Command 3: Push to GitHub
+git push -u origin main
+
+When prompted for username: u-harshitha007
+When prompted for password: Use Personal Access Token (see below)
+
+========================================
+STEP 3: Get Personal Access Token
+========================================
+
+If git asks for password:
+
+1. Go to: https://github.com/settings/tokens
+2. Click "Generate new token (classic)"
+3. Name it: "AgentShield Hackfest"
+4. Select scope: "repo" (check the box)
+5. Click "Generate token"
+6. COPY THE TOKEN (you'll only see it once!)
+7. Paste it when git asks for password
+
+========================================
+THAT'S IT!
+========================================
+
+Your repository will be at:
+https://github.com/u-harshitha007/agentshield
+
+Then share this link with your team!
+
+========================================
+QUICK VERIFICATION
+========================================
+
+After pushing, check:
+1. Go to: https://github.com/u-harshitha007/agentshield
+2. You should see:
+   - README.md with project description
+   - docs/ folder
+   - services/agent/ folder
+   - 46 files total
+
+========================================
