@@ -24,6 +24,7 @@ class ToolExecutor:
         args: dict[str, Any],
         task_id: str,
         step_id: str,
+        lease_id: str,
         lease_token: str,
     ) -> dict[str, Any]:
         """
@@ -34,6 +35,7 @@ class ToolExecutor:
             args: Tool arguments
             task_id: Current task ID
             step_id: Current step ID
+            lease_id: Capability lease ID
             lease_token: Capability lease token
             
         Returns:
@@ -41,19 +43,13 @@ class ToolExecutor:
         """
         call_id = str(uuid4())
         
-        # Generate idempotency key for write tools
-        idempotency_key = None
-        if tool_name in self._write_tools():
-            idempotency_key = self._generate_idempotency_key(tool_name, args)
-        
         payload = {
             "call_id": call_id,
-            "idempotency_key": idempotency_key,
             "task_id": task_id,
-            "step_id": step_id,
-            "tool": tool_name,
-            "args": args,
-            "issued_at": datetime.now(timezone.utc).isoformat(),
+            "lease_id": lease_id,
+            "tool_name": tool_name,
+            "tool_args": args,
+            "context": {"step_id": step_id},
         }
         
         headers = {

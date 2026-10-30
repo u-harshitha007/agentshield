@@ -35,12 +35,20 @@ class TaskResponse(BaseModel):
     current_step: int = 0
 
 
-async def execute_task_background(task_id: str, goal: str, lease_token: str):
+async def execute_task_background(task_id: str, goal: str, lease_id: str, lease_token: str):
     """Execute task in background."""
-    executor = AgentExecutor()
-    
+    print(f"=== BACKGROUND_TASK EXECUTING === task_id={task_id}")
     try:
-        result = await executor.execute_task(task_id, goal, lease_token)
+        logger.info("BACKGROUND_TASK_STARTED", task_id=task_id, goal=goal)
+        
+        # Update status to show execution started
+        if task_id in tasks_store:
+            tasks_store[task_id]["status"] = "EXECUTING"
+        
+        executor = AgentExecutor()
+        
+        logger.info("EXECUTOR_STARTING", task_id=task_id)
+        result = await executor.execute_task(task_id, goal, lease_id, lease_token)
         
         # Update task store
         if task_id in tasks_store:
@@ -54,7 +62,7 @@ async def execute_task_background(task_id: str, goal: str, lease_token: str):
         logger.info("task.background.completed", task_id=task_id, status=result["status"])
         
     except Exception as e:
-        logger.error("task.background.failed", task_id=task_id, error=str(e))
+        logger.error("task.background.failed", task_id=task_id, error=str(e), exc_info=True)
         if task_id in tasks_store:
             tasks_store[task_id].update({
                 "status": "FAILED",
@@ -75,6 +83,7 @@ async def create_task(request: CreateTaskRequest, background_tasks: BackgroundTa
     """
     task_id = str(uuid4())
     
+    print(f"=== CREATE_TASK CALLED === task_id={task_id}, goal={request.goal}")
     logger.info("task.create.requested", task_id=task_id, goal=request.goal)
     
     # Request lease from gateway
@@ -97,6 +106,8 @@ async def create_task(request: CreateTaskRequest, background_tasks: BackgroundTa
                 )
             
             lease_data = lease_response.json()
+            print(f"=== LEASE_DATA RECEIVED === {lease_data}")
+            print(f"=== LEASE_TOKEN === {lease_data.get('lease_token')}")
             
     except httpx.HTTPError as e:
         logger.error("lease.request_failed", error=str(e))
@@ -128,6 +139,7 @@ async def create_task(request: CreateTaskRequest, background_tasks: BackgroundTa
         execute_task_background,
         task_id,
         request.goal,
+        lease_data.get("lease_id"),
         lease_data.get("lease_token"),
     )
     

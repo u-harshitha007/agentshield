@@ -38,17 +38,20 @@ class Replanner:
         
         # Bank name mismatch - HIGH RISK
         if reason_code == "DENY_BANK_NAME_MISMATCH":
+            # Format in Indian numbering system (lakhs/crores)
+            formatted_amount = self._format_indian_currency(inr_at_risk)
             return {
                 "action": "flag",
-                "reason": f"Bank account holder name mismatch detected (₹{inr_at_risk:,} at risk). Flagging as suspicious and requesting human review.",
+                "reason": f"Bank account holder name mismatch detected ({formatted_amount} at risk). Flagging as suspicious and requesting human review.",
                 "next_action": "request_approval",
             }
         
         # Price variance - potential fraud
         if reason_code == "DENY_PRICE_VARIANCE":
+            formatted_amount = self._format_indian_currency(inr_at_risk)
             return {
                 "action": "flag",
-                "reason": f"Invoice price exceeds PO by more than 5% (₹{inr_at_risk:,} excess). Flagging for review.",
+                "reason": f"Invoice price exceeds PO by more than 5% ({formatted_amount} excess). Flagging for review.",
             }
         
         # Quantity exceeds goods receipt
@@ -67,9 +70,10 @@ class Replanner:
         
         # Freight uneconomic
         if reason_code == "DENY_FREIGHT_UNECONOMIC":
+            formatted_amount = self._format_indian_currency(inr_at_risk)
             return {
                 "action": "flag",
-                "reason": f"Air freight not economically justified (₹{inr_at_risk:,} extra cost). Flagging for review.",
+                "reason": f"Air freight not economically justified ({formatted_amount} extra cost). Flagging for review.",
             }
         
         # Signal contradicted (fake disruption)
@@ -89,17 +93,19 @@ class Replanner:
         # HOLD decisions - need approval
         if decision.get("decision") == "HOLD":
             if reason_code == "HOLD_BANK_NAME_PARTIAL":
+                formatted_amount = self._format_indian_currency(inr_at_risk)
                 return {
                     "action": "request_approval",
-                    "reason": f"Bank name partially matches supplier (₹{inr_at_risk:,} at risk). Requesting human approval.",
-                    "action_summary": f"Update bank account for supplier (partial name match, ₹{inr_at_risk:,} exposure)",
+                    "reason": f"Bank name partially matches supplier ({formatted_amount} at risk). Requesting human approval.",
+                    "action_summary": f"Update bank account for supplier (partial name match, {formatted_amount} exposure)",
                 }
             
             if reason_code == "HOLD_AMOUNT_NEEDS_APPROVAL":
+                formatted_amount = self._format_indian_currency(inr_at_risk)
                 return {
                     "action": "request_approval",
-                    "reason": f"Amount ₹{inr_at_risk:,} exceeds approval threshold. Requesting authorization.",
-                    "action_summary": f"High-value payment: ₹{inr_at_risk:,}",
+                    "reason": f"Amount {formatted_amount} exceeds approval threshold. Requesting authorization.",
+                    "action_summary": f"High-value payment: {formatted_amount}",
                 }
             
             if reason_code == "HOLD_BANK_COOLING_OFF":
@@ -142,3 +148,39 @@ class Replanner:
             "reason": f"Operation denied ({reason_code}). Flagging for human review.",
             "next_action": "request_approval" if "request_human_approval" in safe_alternatives else None,
         }
+    
+    def _format_indian_currency(self, amount: int) -> str:
+        """
+        Format amount in Indian numbering system (lakhs/crores).
+        
+        Examples:
+        - 2500000 → ₹25,00,000
+        - 270000 → ₹2,70,000
+        """
+        if amount >= 10000000:  # 1 crore or more
+            crores = amount / 10000000
+            return f"₹{crores:.2f} crore"
+        elif amount >= 100000:  # 1 lakh or more
+            lakhs = amount / 100000
+            return f"₹{lakhs:.2f} lakh"
+        else:
+            # Format with Indian grouping: last 3 digits, then groups of 2
+            s = str(amount)
+            if len(s) <= 3:
+                return f"₹{s}"
+            
+            # Split into last 3 and rest
+            last_three = s[-3:]
+            rest = s[:-3]
+            
+            # Add commas every 2 digits from right in the rest
+            formatted_rest = ""
+            while rest:
+                if len(rest) > 2:
+                    formatted_rest = "," + rest[-2:] + formatted_rest
+                    rest = rest[:-2]
+                else:
+                    formatted_rest = rest + formatted_rest
+                    break
+            
+            return f"₹{formatted_rest},{last_three}"

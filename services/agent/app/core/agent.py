@@ -7,7 +7,10 @@ import httpx
 import structlog
 
 from app.core.config import settings
+from app.core.events import EventEmitter
 from app.core.llm import OllamaClient
+from app.core.memory import TaskMemory
+from app.core.replay import ReplayManager
 from app.core.replan import Replanner
 from app.core.tools import ToolExecutor, get_tool_schemas
 from app.db.models import TaskStatus
@@ -22,8 +25,10 @@ class AgentExecutor:
         self.llm = OllamaClient()
         self.tools = ToolExecutor()
         self.replanner = Replanner()
+        self.events = EventEmitter()
+        self.replay = ReplayManager()
         
-    async def execute_task(self, task_id: str, goal: str, lease_token: str):
+    async def execute_task(self, task_id: str, goal: str, lease_id: str, lease_token: str):
         """
         Execute a task with the agent.
         
@@ -31,6 +36,9 @@ class AgentExecutor:
         RECEIVED → PLANNING → EXECUTING ⇄ REPLANNING → AWAITING_APPROVAL → COMPLETED/FAILED
         """
         start_time = time.time()
+        
+        # Initialize task memory
+        memory = TaskMemory(task_id)
         
         context = {
             "goal": goal,
@@ -41,11 +49,19 @@ class AgentExecutor:
             "llm_calls_count": 0,
             "replans_count": 0,
             "observations": [],
-            "memory": {},
+            "memory": memory,
             "status": TaskStatus.PLANNING.value,
+            "pending_approvals": [],  # Track approval requests
         }
         
         logger.info("agent.task.started", task_id=task_id, goal=goal)
+        
+        # Emit task created event
+        await self.events.emit("agent.task.created", {
+            "task_id": task_id,
+            "goal": goal,
+            "lease_token_preview": lease_token[:20] + "..." if lease_token else None,
+        })
         
         try:
             # PLANNING → EXECUTING loop
@@ -71,7 +87,29 @@ class AgentExecutor:
                 )
                 
                 context["llm_calls_count"] += 1
-                action = await self.llm.plan_action(context, available_tools)
+                
+                # Check if in replay mode
+                if self.replay.is_replay_mode():
+                    # Get recorded action
+                    action = self.replay.get_next_action()
+                    
+                    if action is None:
+                        # Replay exhausted
+                        raise Exception("Replay trace exhausted")
+                    
+                    logger.info(
+                        "agent.action_replayed",
+                        tool=action.get("tool"),
+                        mode="REPLAY",
+                    )
+                else:
+                    # Convert memory to dict for LLM context
+                    llm_context = {
+                        **context,
+                        "memory": context["memory"].get_all() if isinstance(context["memory"], TaskMemory) else context["memory"],
+                    }
+                    
+                    action = await self.llm.plan_action(llm_context, available_tools)
                 
                 tool_name = action["tool"]
                 tool_args = action["args"]
@@ -81,7 +119,17 @@ class AgentExecutor:
                     "agent.action_planned",
                     tool=tool_name,
                     reasoning=reasoning[:100],
+                    mode="REPLAY" if self.replay.is_replay_mode() else "LIVE",
                 )
+                
+                # Emit LLM call event
+                await self.events.emit("agent.llm.call", {
+                    "task_id": task_id,
+                    "step": context["current_step"],
+                    "tool_proposed": tool_name,
+                    "llm_call_id": action.get("llm_call_id"),
+                    "replay_mode": self.replay.is_replay_mode(),
+                })
                 
                 # Execute tool through gateway
                 context["status"] = TaskStatus.EXECUTING.value
@@ -94,8 +142,19 @@ class AgentExecutor:
                     args=tool_args,
                     task_id=task_id,
                     step_id=step_id,
+                    lease_id=lease_id,
                     lease_token=lease_token,
                 )
+                
+                # Emit tool call event
+                await self.events.emit("agent.tool.called", {
+                    "task_id": task_id,
+                    "step": context["current_step"],
+                    "tool": tool_name,
+                    "decision": decision["decision"],
+                    "reason_code": decision.get("reason_code"),
+                    "decision_id": decision.get("decision_id"),
+                })
                 
                 # Record observation
                 observation = {
@@ -104,6 +163,7 @@ class AgentExecutor:
                     "decision": decision["decision"],
                     "reason_code": decision.get("reason_code"),
                     "result": decision.get("result"),
+                    "decision_id": decision.get("decision_id"),
                 }
                 context["observations"].append(observation)
                 
@@ -122,6 +182,16 @@ class AgentExecutor:
                     if tool_name == "complete_task":
                         context["status"] = TaskStatus.COMPLETED.value
                         logger.info("agent.task.completed", task_id=task_id)
+                        
+                        # Emit completion event
+                        await self.events.emit("agent.task.completed", {
+                            "task_id": task_id,
+                            "steps": context["current_step"],
+                            "tool_calls": context["tool_calls_count"],
+                            "llm_calls": context["llm_calls_count"],
+                            "replans": context["replans_count"],
+                        })
+                        
                         return context
                     
                 elif decision["decision"] in ["DENY", "HOLD"]:
@@ -153,16 +223,47 @@ class AgentExecutor:
                         reason=new_plan["reason"],
                     )
                     
+                    # Emit replanning event
+                    await self.events.emit("agent.replanned", {
+                        "task_id": task_id,
+                        "original_tool": tool_name,
+                        "decision": decision["decision"],
+                        "reason_code": decision.get("reason_code"),
+                        "new_action": new_plan["action"],
+                        "decision_id": decision.get("decision_id"),
+                    })
+                    
                     # Execute safe alternative if specified
                     if new_plan["action"] in ["flag", "request_approval"]:
                         # Execute the safe tool
-                        await self._execute_safe_action(
+                        approval_result = await self._execute_safe_action(
                             new_plan,
                             task_id,
                             step_id,
+                            lease_id,
                             lease_token,
                             context,
                         )
+                        
+                        # If we requested approval, wait for it
+                        if new_plan["action"] == "request_approval" and approval_result:
+                            approval_id = approval_result.get("result", {}).get("approval_id")
+                            if approval_id:
+                                context["pending_approvals"].append({
+                                    "approval_id": approval_id,
+                                    "original_tool": tool_name,
+                                    "original_args": tool_args,
+                                    "step_id": step_id,
+                                })
+                                
+                                # Check for approval (non-blocking for now)
+                                approval_granted = await self._check_approval(approval_id, context)
+                                
+                                if approval_granted:
+                                    # Retry the original operation with approval
+                                    logger.info("approval.granted", approval_id=approval_id, retrying=tool_name)
+                                    # Note: In full implementation, would retry here
+                                    # For now, just log and continue
                     
                     # If action is "abort", break
                     if new_plan["action"] == "abort":
@@ -179,6 +280,14 @@ class AgentExecutor:
             context["status"] = TaskStatus.FAILED.value
             context["failure_reason"] = str(e)
             logger.error("agent.task.failed", task_id=task_id, error=str(e))
+            
+            # Emit failure event
+            await self.events.emit("agent.task.failed", {
+                "task_id": task_id,
+                "reason": str(e),
+                "steps_completed": context["current_step"],
+            })
+            
             return context
     
     def _get_available_tools(self, context: dict) -> list:
@@ -231,40 +340,60 @@ class AgentExecutor:
         if not result:
             return
         
-        memory = context.get("memory", {})
+        memory = context.get("memory")
         
-        # Store key data
-        if tool_name == "read_inbox" and "messages" in result:
-            memory["inbox_messages"] = result["messages"]
-        
-        elif tool_name == "get_purchase_order":
-            memory["purchase_order"] = result
-        
-        elif tool_name == "get_supplier":
-            memory["supplier"] = result
-        
-        elif tool_name == "get_goods_receipts":
-            memory["goods_receipts"] = result
-        
-        elif tool_name == "post_supplier_invoice":
-            memory["posted_invoice"] = result
-        
-        context["memory"] = memory
+        # Use TaskMemory if available, otherwise fall back to dict
+        if isinstance(memory, TaskMemory):
+            # Store with appropriate source marking
+            if tool_name in ["read_inbox", "get_document_text"]:
+                # External content - mark as untrusted
+                memory.store_fact(tool_name, result, source="external")
+            else:
+                # ERP data - trusted
+                memory.store_fact(tool_name, result, source="erp")
+        else:
+            # Fallback to dict (for backward compatibility)
+            if not isinstance(memory, dict):
+                memory = {}
+            
+            # Store key data
+            if tool_name == "read_inbox" and "messages" in result:
+                memory["inbox_messages"] = result["messages"]
+            elif tool_name == "get_purchase_order":
+                memory["purchase_order"] = result
+            elif tool_name == "get_supplier":
+                memory["supplier"] = result
+            elif tool_name == "get_goods_receipts":
+                memory["goods_receipts"] = result
+            elif tool_name == "post_supplier_invoice":
+                memory["posted_invoice"] = result
+            
+            context["memory"] = memory
     
     async def _execute_safe_action(
         self,
         plan: dict,
         task_id: str,
         step_id: str,
+        lease_id: str,
         lease_token: str,
         context: dict,
-    ):
+    ) -> dict | None:
         """Execute a safe alternative action."""
         if plan["action"] == "flag":
             # Flag suspicious message
-            message_id = context.get("memory", {}).get("inbox_messages", [{}])[0].get("message_id", "unknown")
+            memory = context.get("memory")
             
-            await self.tools.execute_tool(
+            # Get message_id from memory
+            if isinstance(memory, TaskMemory):
+                inbox_data = memory.get_fact("read_inbox")
+                messages = inbox_data.get("messages", []) if inbox_data else []
+            else:
+                messages = memory.get("inbox_messages", []) if isinstance(memory, dict) else []
+            
+            message_id = messages[0].get("message_id", "unknown") if messages else "unknown"
+            
+            result = await self.tools.execute_tool(
                 tool_name="flag_suspicious_message",
                 args={
                     "message_id": message_id,
@@ -272,12 +401,14 @@ class AgentExecutor:
                 },
                 task_id=task_id,
                 step_id=f"{step_id}-flag",
+                lease_id=lease_id,
                 lease_token=lease_token,
             )
+            return result
         
         elif plan["action"] == "request_approval":
             # Request human approval
-            await self.tools.execute_tool(
+            result = await self.tools.execute_tool(
                 tool_name="request_human_approval",
                 args={
                     "action_summary": plan.get("action_summary", "Sensitive action needs approval"),
@@ -285,5 +416,25 @@ class AgentExecutor:
                 },
                 task_id=task_id,
                 step_id=f"{step_id}-approval",
+                lease_id=lease_id,
                 lease_token=lease_token,
             )
+            return result
+        
+        return None
+    
+    async def _check_approval(self, approval_id: str, context: dict) -> bool:
+        """
+        Check if approval has been granted (non-blocking).
+        
+        In full implementation, this would poll the gateway.
+        For now, returns False to not block task execution.
+        """
+        try:
+            # Would poll gateway: GET /v1/approvals/{approval_id}
+            # For now, just log and continue
+            logger.info("approval.check", approval_id=approval_id, status="pending")
+            return False
+        except Exception as e:
+            logger.warning("approval.check_failed", approval_id=approval_id, error=str(e))
+            return False

@@ -22,7 +22,8 @@ def test_bank_name_mismatch_replan():
     )
     
     assert plan["action"] == "flag"
-    assert "₹25,00,000" in plan["reason"] or "2500000" in plan["reason"]
+    # Accept Indian lakh format (₹25.00 lakh) or raw number
+    assert ("25.00 lakh" in plan["reason"] or "25,00,000" in plan["reason"] or "2500000" in plan["reason"])
     assert "mismatch" in plan["reason"].lower()
 
 
