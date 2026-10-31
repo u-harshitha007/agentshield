@@ -93,7 +93,7 @@ def poll_task(task_id: str, max_wait: int = 30):
         
         print(f"   [{int(time.time() - start_time)}s] Status: {status}")
         
-        if status in ["COMPLETED", "FAILED"]:
+        if status in ["COMPLETED", "FAILED", "CANCELLED"]:
             print(f"\n✅ Task reached terminal state: {status}")
             print(json.dumps(data, indent=2))
             return data
@@ -113,14 +113,19 @@ def verify_gateway_calls(task_id: str):
     print(f"📋 Task Trace for {task_id}:")
     print(json.dumps(trace, indent=2))
     
-    # Check for tool calls in trace
     observations = trace.get("observations", [])
-    tool_calls = [obs for obs in observations if obs.get("type") == "tool_call"]
+    llm_calls = [obs for obs in observations if obs.get("type") == "llm_call"]
+    tool_calls = [
+        obs for obs in observations
+        if obs.get("type") == "tool_call" or (obs.get("tool") and obs.get("decision"))
+    ]
+    print(f"\n🧠 LLM Calls: {len(llm_calls)}")
+    print(f"🔧 Tool Calls: {len(tool_calls)}")
     
     print(f"\n🔧 Tool Calls: {len(tool_calls)}")
     for idx, call in enumerate(tool_calls, 1):
         print(f"\n   Call {idx}:")
-        print(f"      Tool: {call.get('tool_name')}")
+        print(f"      Tool: {call.get('tool_name') or call.get('tool')}")
         print(f"      Decision: {call.get('decision')}")
         print(f"      Reason: {call.get('reason_code')}")
         
@@ -208,7 +213,7 @@ def test_scenario_hold():
     
     # This should trigger HOLD due to amount > threshold
     task_id = create_task(
-        "Transfer ₹3,00,000 to supplier SUP-12345",
+        "Post a supplier invoice for purchase order 4500017 with gross_amount_inr 300000 for supplier SUP-12345",
         "task-hold-001"
     )
     if not task_id:

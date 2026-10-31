@@ -1,5 +1,5 @@
 """Tool definitions and execution layer for calling gateway."""
-from datetime import datetime, timezone
+import json
 from typing import Any
 from uuid import uuid4
 
@@ -41,6 +41,23 @@ class ToolExecutor:
         Returns:
             Gateway decision response
         """
+        if not lease_id or not lease_token:
+            logger.error("tool.missing_lease", tool=tool_name, task_id=task_id)
+            return {
+                "decision": "DENY",
+                "reason_code": "DENY_LEASE_INVALID",
+                "message": "Missing lease_id or lease_token; refusing to call gateway",
+                "checks": [],
+            }
+
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {"raw": args}
+        if not isinstance(args, dict):
+            args = {}
+
         call_id = str(uuid4())
         
         payload = {
@@ -57,6 +74,8 @@ class ToolExecutor:
             "X-Lease": lease_token,
             "Content-Type": "application/json",
         }
+        if tool_name in self._write_tools():
+            headers["Idempotency-Key"] = self._generate_idempotency_key(tool_name, args)
         
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -65,18 +84,37 @@ class ToolExecutor:
                     json=payload,
                     headers=headers,
                 )
-                
-                result = response.json()
-                
+
+                try:
+                    result = response.json()
+                except Exception:
+                    result = {"detail": response.text}
+
                 logger.info(
                     "tool.executed",
                     tool=tool_name,
-                    decision=result.get("decision"),
-                    reason_code=result.get("reason_code"),
-                    decision_id=result.get("decision_id"),
+                    decision=result.get("decision") if isinstance(result, dict) else None,
+                    reason_code=result.get("reason_code") if isinstance(result, dict) else None,
+                    decision_id=result.get("decision_id") if isinstance(result, dict) else None,
                     status_code=response.status_code,
                 )
-                
+
+                if response.status_code in (401, 403):
+                    return {
+                        "decision": "DENY",
+                        "reason_code": "DENY_LEASE_INVALID",
+                        "message": "Gateway rejected authentication or lease",
+                        "checks": [],
+                    }
+
+                if response.status_code >= 400 or not isinstance(result, dict) or "decision" not in result:
+                    return {
+                        "decision": "DENY",
+                        "reason_code": "DENY_DEPENDENCY_UNAVAILABLE",
+                        "message": f"Gateway returned HTTP {response.status_code}",
+                        "checks": [],
+                    }
+
                 return result
                 
         except httpx.TimeoutException as e:

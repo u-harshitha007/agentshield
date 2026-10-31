@@ -1,4 +1,5 @@
 """Agent state machine and executor."""
+import asyncio
 import time
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -52,6 +53,7 @@ class AgentExecutor:
             "memory": memory,
             "status": TaskStatus.PLANNING.value,
             "pending_approvals": [],  # Track approval requests
+            "denied_tools": set(),
         }
         
         logger.info("agent.task.started", task_id=task_id, goal=goal)
@@ -113,7 +115,7 @@ class AgentExecutor:
                 
                 tool_name = action["tool"]
                 tool_args = action["args"]
-                reasoning = action.get("reasoning", "")
+                reasoning = action.get("reasoning") or ""
                 
                 logger.info(
                     "agent.action_planned",
@@ -130,6 +132,28 @@ class AgentExecutor:
                     "llm_call_id": action.get("llm_call_id"),
                     "replay_mode": self.replay.is_replay_mode(),
                 })
+                context["observations"].append({
+                    "type": "llm_call",
+                    "step": context["current_step"],
+                    "tool_proposed": tool_name,
+                    "llm_call_id": action.get("llm_call_id"),
+                    "reasoning": reasoning[:200] if reasoning else "",
+                })
+
+                # Never retry a tool that the gateway already DENY'd.
+                if tool_name in context["denied_tools"]:
+                    logger.warning("agent.denied_tool_retry_blocked", tool=tool_name)
+                    context["observations"].append({
+                        "type": "replan",
+                        "step": context["current_step"],
+                        "tool": tool_name,
+                        "tool_name": tool_name,
+                        "decision": "DENY",
+                        "reason_code": "DENY_RETRY_BLOCKED",
+                        "message": "Blocked retry of a previously denied tool",
+                    })
+                    context["current_step"] += 1
+                    continue
                 
                 # Execute tool through gateway
                 context["status"] = TaskStatus.EXECUTING.value
@@ -158,12 +182,17 @@ class AgentExecutor:
                 
                 # Record observation
                 observation = {
+                    "type": "tool_call",
                     "step": context["current_step"],
                     "tool": tool_name,
+                    "tool_name": tool_name,
                     "decision": decision["decision"],
                     "reason_code": decision.get("reason_code"),
                     "result": decision.get("result"),
                     "decision_id": decision.get("decision_id"),
+                    "approval_id": decision.get("approval_id"),
+                    "safe_alternatives": decision.get("safe_alternatives", []),
+                    "message": decision.get("message"),
                 }
                 context["observations"].append(observation)
                 
@@ -193,16 +222,73 @@ class AgentExecutor:
                         })
                         
                         return context
-                    
-                elif decision["decision"] in ["DENY", "HOLD"]:
+
+                elif decision["decision"] == "HOLD":
                     logger.warning(
-                        "agent.tool.denied_or_held",
+                        "agent.tool.held",
                         tool=tool_name,
-                        decision=decision["decision"],
+                        reason_code=decision.get("reason_code"),
+                        approval_id=decision.get("approval_id"),
+                    )
+                    context["status"] = TaskStatus.AWAITING_APPROVAL.value
+                    approval_id = decision.get("approval_id")
+                    if not approval_id:
+                        raise Exception("Gateway HOLD without approval_id; failing closed")
+
+                    approval = await self._poll_approval(approval_id, timeout_seconds=25)
+                    context["observations"].append({
+                        "type": "approval",
+                        "step": context["current_step"],
+                        "approval_id": approval_id,
+                        "status": approval.get("status"),
+                        "decision": approval.get("decision"),
+                    })
+
+                    if approval.get("granted"):
+                        logger.info("approval.granted", approval_id=approval_id, retrying=tool_name)
+                        context["status"] = TaskStatus.EXECUTING.value
+                        context["tool_calls_count"] += 1
+                        retry_decision = await self.tools.execute_tool(
+                            tool_name=tool_name,
+                            args=tool_args,
+                            task_id=task_id,
+                            step_id=f"{step_id}-approved-retry",
+                            lease_id=lease_id,
+                            lease_token=lease_token,
+                        )
+                        context["observations"].append({
+                            "type": "tool_call",
+                            "step": context["current_step"],
+                            "tool": tool_name,
+                            "tool_name": tool_name,
+                            "decision": retry_decision.get("decision"),
+                            "reason_code": retry_decision.get("reason_code"),
+                            "result": retry_decision.get("result"),
+                            "decision_id": retry_decision.get("decision_id"),
+                            "message": retry_decision.get("message"),
+                        })
+                        if retry_decision.get("decision") == "ALLOW":
+                            self._update_memory(context, tool_name, retry_decision.get("result"))
+                        else:
+                            # Fail closed: do not loop HOLD/DENY retries after a post-approval call.
+                            context["denied_tools"].add(tool_name)
+                            context["status"] = TaskStatus.REPLANNING.value
+                    else:
+                        context["denied_tools"].add(tool_name)
+                        context["status"] = TaskStatus.REPLANNING.value
+                        context["replans_count"] += 1
+                        if context["replans_count"] > settings.max_replans:
+                            raise Exception("Replan budget exhausted after HOLD timeout/denial")
+                    
+                elif decision["decision"] == "DENY":
+                    logger.warning(
+                        "agent.tool.denied",
+                        tool=tool_name,
                         reason_code=decision.get("reason_code"),
                     )
+                    context["denied_tools"].add(tool_name)
                     
-                    # REPLAN
+                    # REPLAN — never retry the denied tool
                     context["status"] = TaskStatus.REPLANNING.value
                     context["replans_count"] += 1
                     
@@ -222,6 +308,17 @@ class AgentExecutor:
                         new_action=new_plan["action"],
                         reason=new_plan["reason"],
                     )
+
+                    context["observations"].append({
+                        "type": "replan",
+                        "step": context["current_step"],
+                        "tool": tool_name,
+                        "tool_name": tool_name,
+                        "decision": decision["decision"],
+                        "reason_code": decision.get("reason_code"),
+                        "new_action": new_plan["action"],
+                        "reason": new_plan["reason"],
+                    })
                     
                     # Emit replanning event
                     await self.events.emit("agent.replanned", {
@@ -233,10 +330,9 @@ class AgentExecutor:
                         "decision_id": decision.get("decision_id"),
                     })
                     
-                    # Execute safe alternative if specified
+                    # Execute safe alternative if specified. Never retry the denied tool.
                     if new_plan["action"] in ["flag", "request_approval"]:
-                        # Execute the safe tool
-                        approval_result = await self._execute_safe_action(
+                        await self._execute_safe_action(
                             new_plan,
                             task_id,
                             step_id,
@@ -244,30 +340,13 @@ class AgentExecutor:
                             lease_token,
                             context,
                         )
-                        
-                        # If we requested approval, wait for it
-                        if new_plan["action"] == "request_approval" and approval_result:
-                            approval_id = approval_result.get("result", {}).get("approval_id")
-                            if approval_id:
-                                context["pending_approvals"].append({
-                                    "approval_id": approval_id,
-                                    "original_tool": tool_name,
-                                    "original_args": tool_args,
-                                    "step_id": step_id,
-                                })
-                                
-                                # Check for approval (non-blocking for now)
-                                approval_granted = await self._check_approval(approval_id, context)
-                                
-                                if approval_granted:
-                                    # Retry the original operation with approval
-                                    logger.info("approval.granted", approval_id=approval_id, retrying=tool_name)
-                                    # Note: In full implementation, would retry here
-                                    # For now, just log and continue
                     
                     # If action is "abort", break
                     if new_plan["action"] == "abort":
                         raise Exception(f"Task aborted: {new_plan['reason']}")
+                else:
+                    # Unknown decision — fail closed
+                    raise Exception(f"Unknown gateway decision: {decision.get('decision')}")
                 
                 context["current_step"] += 1
             
@@ -293,47 +372,58 @@ class AgentExecutor:
     def _get_available_tools(self, context: dict) -> list:
         """Get tools available for current step."""
         observations = context.get("observations", [])
+        denied = context.get("denied_tools", set())
+        tool_obs = [obs.get("tool") for obs in observations if obs.get("tool")]
         
-        # Start with inbox reading
-        if not observations:
-            return get_tool_schemas(["read_inbox"])
-        
-        # After reading inbox, can read documents and get PO/supplier data
-        last_tools = [obs["tool"] for obs in observations[-3:]]
-        
-        if "read_inbox" in last_tools:
-            return get_tool_schemas([
-                "get_document_text",
-                "get_purchase_order",
-                "get_supplier",
-                "flag_suspicious_message",
-            ])
-        
-        # After gathering data, can post invoice
-        if "get_purchase_order" in last_tools:
-            return get_tool_schemas([
-                "get_goods_receipts",
-                "get_supplier_bank",
-                "post_supplier_invoice",
-                "flag_suspicious_message",
-                "request_human_approval",
-            ])
-        
-        # After posting invoice, can pay
-        if "post_supplier_invoice" in last_tools:
-            return get_tool_schemas([
-                "execute_payment",
-                "request_human_approval",
-                "complete_task",
-            ])
-        
-        # Default: read/control tools
-        return get_tool_schemas([
-            "read_inbox",
-            "flag_suspicious_message",
-            "request_human_approval",
-            "complete_task",
-        ])
+        # Keep the list small, but always allow a terminal action.
+        if not tool_obs:
+            names = ["read_inbox", "get_supplier", "get_purchase_order", "complete_task"]
+        else:
+            last_tools = tool_obs[-3:]
+            if "read_inbox" in last_tools:
+                names = [
+                    "get_document_text",
+                    "get_purchase_order",
+                    "get_supplier",
+                    "post_supplier_invoice",
+                    "execute_payment",
+                    "flag_suspicious_message",
+                    "complete_task",
+                ]
+            elif "get_purchase_order" in last_tools or "get_supplier" in last_tools:
+                names = [
+                    "get_goods_receipts",
+                    "get_supplier_bank",
+                    "post_supplier_invoice",
+                    "execute_payment",
+                    "flag_suspicious_message",
+                    "request_human_approval",
+                    "complete_task",
+                ]
+            elif "post_supplier_invoice" in last_tools:
+                names = [
+                    "execute_payment",
+                    "request_human_approval",
+                    "complete_task",
+                ]
+            else:
+                names = [
+                    "read_inbox",
+                    "get_supplier",
+                    "post_supplier_invoice",
+                    "execute_payment",
+                    "flag_suspicious_message",
+                    "request_human_approval",
+                    "complete_task",
+                ]
+
+        names = [name for name in names if name not in denied]
+        if "complete_task" not in denied:
+            names = [name for name in names if name != "complete_task"][:5]
+            names.append("complete_task")
+        else:
+            names = names[:6]
+        return get_tool_schemas(names)
     
     def _update_memory(self, context: dict, tool_name: str, result: dict | None):
         """Update task memory with tool result."""
@@ -404,6 +494,16 @@ class AgentExecutor:
                 lease_id=lease_id,
                 lease_token=lease_token,
             )
+            context["observations"].append({
+                "type": "tool_call",
+                "step": context["current_step"],
+                "tool": "flag_suspicious_message",
+                "tool_name": "flag_suspicious_message",
+                "decision": result.get("decision"),
+                "reason_code": result.get("reason_code"),
+                "decision_id": result.get("decision_id"),
+                "result": result.get("result"),
+            })
             return result
         
         elif plan["action"] == "request_approval":
@@ -419,22 +519,58 @@ class AgentExecutor:
                 lease_id=lease_id,
                 lease_token=lease_token,
             )
+            context["observations"].append({
+                "type": "tool_call",
+                "step": context["current_step"],
+                "tool": "request_human_approval",
+                "tool_name": "request_human_approval",
+                "decision": result.get("decision"),
+                "reason_code": result.get("reason_code"),
+                "decision_id": result.get("decision_id"),
+                "result": result.get("result"),
+            })
             return result
         
         return None
     
-    async def _check_approval(self, approval_id: str, context: dict) -> bool:
-        """
-        Check if approval has been granted (non-blocking).
-        
-        In full implementation, this would poll the gateway.
-        For now, returns False to not block task execution.
-        """
+    async def _poll_approval(self, approval_id: str, timeout_seconds: int = 25) -> dict:
+        """Poll gateway approval status. Timeout and errors fail closed (not granted)."""
+        deadline = time.time() + timeout_seconds
+        headers = {"Authorization": f"Bearer {settings.agent_service_token}"}
+
         try:
-            # Would poll gateway: GET /v1/approvals/{approval_id}
-            # For now, just log and continue
-            logger.info("approval.check", approval_id=approval_id, status="pending")
-            return False
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                while time.time() < deadline:
+                    response = await client.get(
+                        f"{settings.gateway_url}/v1/approvals/{approval_id}",
+                        headers=headers,
+                    )
+                    if response.status_code != 200:
+                        logger.warning(
+                            "approval.poll_http_error",
+                            approval_id=approval_id,
+                            status_code=response.status_code,
+                        )
+                        await asyncio.sleep(2)
+                        continue
+
+                    data = response.json()
+                    status = data.get("status")
+                    decision = data.get("decision")
+                    logger.info(
+                        "approval.check",
+                        approval_id=approval_id,
+                        status=status,
+                        decision=decision,
+                    )
+                    if status == "approved" and decision == "ALLOW":
+                        return {"granted": True, "status": status, "decision": decision}
+                    if status in {"denied", "rejected"} or decision == "DENY":
+                        return {"granted": False, "status": status, "decision": decision}
+                    await asyncio.sleep(2)
         except Exception as e:
             logger.warning("approval.check_failed", approval_id=approval_id, error=str(e))
-            return False
+            return {"granted": False, "status": "error", "decision": None}
+
+        logger.warning("approval.timeout", approval_id=approval_id)
+        return {"granted": False, "status": "timeout", "decision": None}
