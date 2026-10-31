@@ -14,32 +14,52 @@ Configuration:
 - DEFAULT_DECISION: ALLOW, DENY, or HOLD (env: MOCK_DECISION)
 - HIGH_RISK_TOOLS: Tools that trigger DENY (env: HIGH_RISK_TOOLS)
 - APPROVAL_THRESHOLD_INR: Amount requiring approval (env: APPROVAL_THRESHOLD_INR)
+- MOCK_SERVICE_TOKEN: Bearer token required on mutating/protected endpoints
 """
 import os
 import uuid
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
+
+# Load local .env without adding a dotenv dependency.
+_env_path = Path(__file__).resolve().parent.parent / ".env"
+if _env_path.exists():
+    for raw in _env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 # Configuration
 DEFAULT_DECISION = os.getenv("MOCK_DECISION", "ALLOW")  # ALLOW, DENY, HOLD
-HIGH_RISK_TOOLS = os.getenv("HIGH_RISK_TOOLS", "execute_payment,delete_supplier").split(",")
+HIGH_RISK_TOOLS = [
+    item.strip()
+    for item in os.getenv("HIGH_RISK_TOOLS", "execute_payment,delete_supplier").split(",")
+    if item.strip()
+]
 APPROVAL_THRESHOLD_INR = int(os.getenv("APPROVAL_THRESHOLD_INR", "200000"))
+SERVICE_TOKEN = os.getenv("MOCK_SERVICE_TOKEN", "local-agent-token")
 
 app = FastAPI(title="Mock Gateway", version="1.0.0")
 
-# In-memory approval store
+# In-memory stores
 approvals: dict[str, dict] = {}
+leases: dict[str, dict] = {}
 
 
 # === Request/Response Models ===
 
 class LeaseRequest(BaseModel):
     task_id: str
-    requested_by: str | None = "agent-service"  # Default value
+    requested_by: str | None = "agent-service"
     policy_id: str | None = None
+    template: str | None = None
+    context: dict[str, Any] | None = None
 
 
 class LeaseResponse(BaseModel):
@@ -47,7 +67,7 @@ class LeaseResponse(BaseModel):
     task_id: str
     signature: str
     expires_at: str
-    lease_token: str | None = None  # Added for agent compatibility
+    lease_token: str
 
 
 class ToolCallRequest(BaseModel):
@@ -96,15 +116,94 @@ class EventPayload(BaseModel):
 
 # === Helper Functions ===
 
+def _require_service_auth(authorization: str | None) -> None:
+    """Fail closed if the agent service token is missing or wrong."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    token = authorization[len("Bearer "):].strip()
+    if not token or token != SERVICE_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid service token")
+
+
+def _deny_lease(task_id: str, reason_code: str, message: str, checks: list[Check]) -> GatewayDecision:
+    return GatewayDecision(
+        decision_id=f"dec-{uuid.uuid4().hex[:12]}",
+        decision="DENY",
+        reason_code=reason_code,
+        message=message,
+        inr_at_risk=0,
+        formula=None,
+        checks=checks,
+        result=None,
+        approval_id=None,
+        safe_alternatives=["abort_task"],
+        correlation_id=task_id,
+        idempotent_replay=False,
+    )
+
+
+def _verify_lease(request: ToolCallRequest, x_lease: str | None) -> GatewayDecision | None:
+    """Return a DENY decision if the lease is missing, mismatched, or expired."""
+    if not x_lease:
+        return _deny_lease(
+            request.task_id,
+            "DENY_LEASE_INVALID",
+            "X-Lease header is required",
+            [Check(name="lease.token", result="fail", detail="missing X-Lease")],
+        )
+
+    record = leases.get(request.lease_id)
+    if not record:
+        return _deny_lease(
+            request.task_id,
+            "DENY_LEASE_INVALID",
+            "Unknown lease_id",
+            [Check(name="lease.id", result="fail", detail="lease not issued")],
+        )
+
+    if record["lease_token"] != x_lease:
+        return _deny_lease(
+            request.task_id,
+            "DENY_LEASE_INVALID",
+            "Lease token does not match issued lease",
+            [Check(name="lease.token", result="fail", detail="token mismatch")],
+        )
+
+    if record["task_id"] != request.task_id:
+        return _deny_lease(
+            request.task_id,
+            "DENY_LEASE_INVALID",
+            "Lease was not issued for this task_id",
+            [Check(name="lease.task", result="fail", detail="task mismatch")],
+        )
+
+    expires_at = datetime.fromisoformat(record["expires_at"])
+    if datetime.now(timezone.utc) > expires_at:
+        return _deny_lease(
+            request.task_id,
+            "DENY_LEASE_EXPIRED",
+            "Lease has expired",
+            [Check(name="lease.expiry", result="fail", detail="expired")],
+        )
+
+    return None
+
+
 def _extract_amount(tool_args: dict) -> int | None:
     """Extract INR amount from tool arguments."""
-    for key in ["amount", "amount_inr", "value", "payment_amount"]:
+    for key in [
+        "amount",
+        "amount_inr",
+        "gross_amount_inr",
+        "quoted_cost_inr",
+        "value",
+        "payment_amount",
+    ]:
         if key in tool_args:
             val = tool_args[key]
             if isinstance(val, (int, float)):
                 return int(val)
             if isinstance(val, str):
-                # Remove currency symbols and commas
                 clean = val.replace("₹", "").replace(",", "").strip()
                 try:
                     return int(float(clean))
@@ -117,8 +216,8 @@ def _make_decision(tool_name: str, tool_args: dict, task_id: str) -> GatewayDeci
     """Make a mock gateway decision based on configuration."""
     decision_id = f"dec-{uuid.uuid4().hex[:12]}"
     amount = _extract_amount(tool_args)
-    
-    # Check for high-risk tools (DENY)
+
+    # Check for high-risk tools (DENY) — never overridden by a later approval.
     if tool_name in HIGH_RISK_TOOLS:
         return GatewayDecision(
             decision_id=decision_id,
@@ -137,7 +236,30 @@ def _make_decision(tool_name: str, tool_args: dict, task_id: str) -> GatewayDeci
             correlation_id=task_id,
             idempotent_replay=False,
         )
-    
+
+    # A prior HOLD that was approved should ALLOW the same task+tool retry.
+    if any(
+        record.get("task_id") == task_id
+        and record.get("tool_name") == tool_name
+        and record.get("status") == "approved"
+        and record.get("decision") == "ALLOW"
+        for record in approvals.values()
+    ):
+        return GatewayDecision(
+            decision_id=decision_id,
+            decision="ALLOW",
+            reason_code="ALLOW_OK",
+            message="Operation allowed after human approval",
+            inr_at_risk=0,
+            formula=None,
+            checks=[Check(name="lease.signature", result="pass"), Check(name="approval", result="pass")],
+            result={"status": "success", "mock": True, "tool_name": tool_name, "approved": True},
+            approval_id=None,
+            safe_alternatives=[],
+            correlation_id=task_id,
+            idempotent_replay=False,
+        )
+
     # Check for amount threshold (HOLD)
     if amount and amount > APPROVAL_THRESHOLD_INR:
         approval_id = f"appr-{uuid.uuid4().hex[:12]}"
@@ -163,7 +285,7 @@ def _make_decision(tool_name: str, tool_args: dict, task_id: str) -> GatewayDeci
             correlation_id=task_id,
             idempotent_replay=False,
         )
-    
+
     # Default decision (configurable)
     if DEFAULT_DECISION == "DENY":
         return GatewayDecision(
@@ -180,7 +302,7 @@ def _make_decision(tool_name: str, tool_args: dict, task_id: str) -> GatewayDeci
             correlation_id=task_id,
             idempotent_replay=False,
         )
-    
+
     if DEFAULT_DECISION == "HOLD":
         approval_id = f"appr-{uuid.uuid4().hex[:12]}"
         approvals[approval_id] = {
@@ -204,7 +326,7 @@ def _make_decision(tool_name: str, tool_args: dict, task_id: str) -> GatewayDeci
             correlation_id=task_id,
             idempotent_replay=False,
         )
-    
+
     # ALLOW (default)
     return GatewayDecision(
         decision_id=decision_id,
@@ -214,7 +336,7 @@ def _make_decision(tool_name: str, tool_args: dict, task_id: str) -> GatewayDeci
         inr_at_risk=0,
         formula=None,
         checks=[Check(name="lease.signature", result="pass")],
-        result={"status": "success", "mock": True},
+        result={"status": "success", "mock": True, "tool_name": tool_name, "tool_args": tool_args},
         approval_id=None,
         safe_alternatives=[],
         correlation_id=task_id,
@@ -231,13 +353,25 @@ async def health():
 
 
 @app.post("/v1/tasks", response_model=LeaseResponse)
-async def issue_lease(request: LeaseRequest):
+async def issue_lease(
+    request: LeaseRequest,
+    authorization: str | None = Header(default=None),
+):
     """Issue a capability lease for a task."""
+    _require_service_auth(authorization)
+
     lease_id = f"lease-{uuid.uuid4().hex[:12]}"
     signature = f"sig-{uuid.uuid4().hex[:16]}"
     lease_token = f"token-{uuid.uuid4().hex[:16]}"
     expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-    
+
+    leases[lease_id] = {
+        "lease_id": lease_id,
+        "lease_token": lease_token,
+        "task_id": request.task_id,
+        "expires_at": expires_at,
+    }
+
     return LeaseResponse(
         lease_id=lease_id,
         task_id=request.task_id,
@@ -248,29 +382,42 @@ async def issue_lease(request: LeaseRequest):
 
 
 @app.post("/v1/tool-calls", response_model=GatewayDecision)
-async def evaluate_tool_call(request: ToolCallRequest):
+async def evaluate_tool_call(
+    request: ToolCallRequest,
+    authorization: str | None = Header(default=None),
+    x_lease: str | None = Header(default=None),
+):
     """Evaluate a tool call and return ALLOW/DENY/HOLD decision."""
+    _require_service_auth(authorization)
+    lease_denial = _verify_lease(request, x_lease)
+    if lease_denial:
+        return lease_denial
     return _make_decision(request.tool_name, request.tool_args, request.task_id)
 
 
 @app.get("/v1/approvals/{approval_id}", response_model=ApprovalStatus)
-async def get_approval_status(approval_id: str):
+async def get_approval_status(
+    approval_id: str,
+    authorization: str | None = Header(default=None),
+):
     """Get approval status (for HOLD polling)."""
+    _require_service_auth(authorization)
+
     if approval_id not in approvals:
         raise HTTPException(status_code=404, detail="Approval not found")
-    
+
     approval = approvals[approval_id]
-    
+
     # Mock: auto-approve after 10 seconds (for testing)
     created_at = datetime.fromisoformat(approval["created_at"])
     age_seconds = (datetime.now(timezone.utc) - created_at).total_seconds()
-    
+
     if age_seconds > 10 and approval["status"] == "pending":
         approval["status"] = "approved"
         approval["decision"] = "ALLOW"
         approval["approved_by"] = "mock-auto-approver"
         approval["approved_at"] = datetime.now(timezone.utc).isoformat()
-    
+
     return ApprovalStatus(
         approval_id=approval["approval_id"],
         status=approval["status"],
@@ -282,8 +429,12 @@ async def get_approval_status(approval_id: str):
 
 
 @app.post("/v1/events")
-async def receive_event(event: EventPayload):
+async def receive_event(
+    event: EventPayload,
+    authorization: str | None = Header(default=None),
+):
     """Receive events from agent (no-op for mock)."""
+    _require_service_auth(authorization)
     return {"status": "received", "event_type": event.event_type}
 
 

@@ -1,5 +1,4 @@
 """Task management endpoints."""
-import asyncio
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -35,9 +34,21 @@ class TaskResponse(BaseModel):
     current_step: int = 0
 
 
+def _serialize_task_result(result: dict) -> dict:
+    """Make executor context JSON-serializable for traces."""
+    serialized = dict(result)
+    memory = serialized.get("memory")
+    if hasattr(memory, "get_all"):
+        serialized["memory"] = memory.get_all()
+    denied = serialized.get("denied_tools")
+    if isinstance(denied, set):
+        serialized["denied_tools"] = sorted(denied)
+    serialized.pop("pending_approvals", None)
+    return serialized
+
+
 async def execute_task_background(task_id: str, goal: str, lease_id: str, lease_token: str):
     """Execute task in background."""
-    print(f"=== BACKGROUND_TASK EXECUTING === task_id={task_id}")
     try:
         logger.info("BACKGROUND_TASK_STARTED", task_id=task_id, goal=goal)
         
@@ -56,7 +67,7 @@ async def execute_task_background(task_id: str, goal: str, lease_id: str, lease_
                 "status": result["status"],
                 "current_step": result.get("current_step", 0),
                 "completed_at": datetime.now(timezone.utc).isoformat(),
-                "result": result,
+                "result": _serialize_task_result(result),
             })
         
         logger.info("task.background.completed", task_id=task_id, status=result["status"])
@@ -83,16 +94,16 @@ async def create_task(request: CreateTaskRequest, background_tasks: BackgroundTa
     """
     task_id = str(uuid4())
     
-    print(f"=== CREATE_TASK CALLED === task_id={task_id}, goal={request.goal}")
     logger.info("task.create.requested", task_id=task_id, goal=request.goal)
     
-    # Request lease from gateway
+    # Request lease from gateway. Fail closed if the gateway cannot issue a real lease.
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             lease_response = await client.post(
                 f"{settings.gateway_url}/v1/tasks",
                 json={
                     "task_id": task_id,
+                    "requested_by": "agent-service",
                     "template": request.template,
                     "context": request.context or {},
                 },
@@ -106,19 +117,20 @@ async def create_task(request: CreateTaskRequest, background_tasks: BackgroundTa
                 )
             
             lease_data = lease_response.json()
-            print(f"=== LEASE_DATA RECEIVED === {lease_data}")
-            print(f"=== LEASE_TOKEN === {lease_data.get('lease_token')}")
+            if not lease_data.get("lease_id") or not lease_data.get("lease_token"):
+                raise HTTPException(
+                    status_code=502,
+                    detail="Gateway lease response missing lease_id or lease_token",
+                )
             
+    except HTTPException:
+        raise
     except httpx.HTTPError as e:
         logger.error("lease.request_failed", error=str(e))
-        # For demo, create a mock lease
-        lease_data = {
-            "task_id": task_id,
-            "lease_id": f"lease-{task_id}",
-            "lease_token": f"mock-lease-token-{task_id}",
-            "expires_at": datetime.now(timezone.utc).isoformat(),
-        }
-        logger.warning("using_mock_lease", message="Gateway not available, using mock lease")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Gateway unavailable; cannot issue capability lease: {e}",
+        )
     
     # Create task record
     task = {
